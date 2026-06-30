@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import os
+import json
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, TypedDict
+
+import numpy as np
+import onnxruntime as ort
 
 from buffer_manager import BufferManager
 
@@ -29,12 +35,8 @@ class PlacedBox(TypedDict):
 class RunResult(TypedDict):
     buffer_size: int
     sequence: List[PlacedBox]
-
-    # 더 이상 적재 가능한 박스를 찾지 못해 자동 종료된 경우 True
     terminated: bool
     terminated_step: Optional[int]
-
-    # 참가자 알고리즘이 명시적으로 적재 종료를 선언한 경우 True
     finished_by_user: bool
 
 
@@ -59,35 +61,59 @@ class AlgorithmConfig:
     buffer_size: int
 
 
+# 학습(model_learn.py)의 Config 기본값. model_meta.json 이 있으면 그 값으로 덮어씀.
+_DEFAULTS = dict(cell=0.01, max_mass=6.0, k_hol=1.8, com_alpha0=0.45, com_alpha1=0.20)
+
+
 class Palletizer:
     """
-    가장 단순한 버퍼 기반 팔레타이저 예제.
+    학습한 DRL(CNN Actor-Critic) 모델을 ONNX로 추론하여 박스 선택·위치·회전을 결정한다.
 
-    동작 방식:
-      - 버퍼 안의 박스를 순서대로 확인
-      - 현재 위치에 놓을 수 있으면 적재
-      - X 방향으로 채움
-      - X 방향 공간이 부족하면 다음 row(Y)
-      - Y 방향 공간도 부족하면 다음 layer(Z)
-      - 참가자가 should_finish()에서 True를 반환하면 명시적으로 종료
-      - 더 이상 놓을 수 없으면 자동 종료
+    핵심: 학습 환경(PalletizingEnv)과 '동일한' 상태/마스크/디코드 로직을 사용해야
+          모델이 올바르게 동작한다. (height map + top-mass + 후보채널 / feasibility mask)
     """
 
     def __init__(self, pallet_cfg: PalletConfig, algo_cfg: AlgorithmConfig) -> None:
         self.pallet = pallet_cfg
         self.algo = algo_cfg
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        # ---- 모델 메타 로드 (격자·mask 파라미터) ----
+        meta_path = os.path.join(here, "model_meta.json")
+        meta = dict(_DEFAULTS)
+        onnx_name = "model.onnx"
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            meta.update(loaded)
+            onnx_name = loaded.get("onnx_path", onnx_name)
+
+        self.cell = float(meta["cell"])
+        self.max_mass = float(meta["max_mass"])
+        self.k_hol = float(meta["k_hol"])
+        self.com_a0 = float(meta["com_alpha0"])
+        self.com_a1 = float(meta["com_alpha1"])
+
+        # 격자 칸 수: 팔레트 크기 / cell (학습과 동일 규약)
+        self.Lc = int(round(self.pallet.length / self.cell))   # X (length)
+        self.Wc = int(round(self.pallet.width / self.cell))    # Y (width)
+        self.Hc = int(round(self.pallet.height / self.cell))   # Z (height)
+        self.N = int(meta.get("N", self.algo.buffer_size))     # 후보 수 = 버퍼 크기
+
+        # ---- ONNX 세션 ----
+        onnx_path = os.path.join(here, onnx_name)
+        if not os.path.exists(onnx_path):
+            raise FileNotFoundError(
+                f"ONNX 모델을 찾을 수 없습니다: {onnx_path}\n"
+                f"export_onnx.py 로 .pt → .onnx 변환 후, model_meta.json 과 함께 두세요.")
+        self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+
         self._reset_state()
 
     def _reset_state(self) -> None:
-        self.cursor_x = 0.0
-        self.cursor_y = 0.0
-        self.layer_z = 0.0
-
-        self.row_depth = 0.0
-        self.layer_height = 0.0
-
+        self.height = np.zeros((self.Lc, self.Wc), dtype=np.int32)
+        self.topmass = np.zeros((self.Lc, self.Wc), dtype=np.float32)
         self.sequence: List[PlacedBox] = []
-
         self.finished = False
         self.terminated_step: Optional[int] = None
         self.finished_by_user = False
@@ -95,126 +121,147 @@ class Palletizer:
     # -----------------------------------------------------------------------
     # 참가자 수정 가능 함수
     # -----------------------------------------------------------------------
-
     def should_finish(self, current_buffer: List[BoxInput]) -> bool:
-        """
-        [참가자 수정 가능]
-        현재 버퍼 상태를 보고 적재를 명시적으로 종료할지 결정한다.
-
-        True 반환:
-          - 더 이상 박스를 처리하지 않고 즉시 종료
-          - 결과 JSON의 finished_by_user가 True로 기록됨
-          - terminated는 False로 유지됨
-
-        False 반환:
-          - 계속 적재 진행
-
-        예시:
-          - 너무 높은 층까지 쌓였다고 판단한 경우
-          - 안정성이 낮아질 것으로 예상되는 경우
-          - 더 쌓는 것보다 현재 상태로 종료하는 것이 유리한 경우
-        """
+        """명시적 종료 판단. (현재는 mask 기반 자동 종료에 위임)"""
         return False
 
     # -----------------------------------------------------------------------
-    # 기본 적재 로직
+    # 셀 단위 footprint
     # -----------------------------------------------------------------------
+    def _cells(self, size: List[float], rot: int) -> Tuple[int, int, int]:
+        l, w, h = float(size[0]), float(size[1]), float(size[2])
+        if rot == 1:                 # 90도: l,w swap
+            l, w = w, l
+        return (max(1, math.ceil(l / self.cell)),
+                max(1, math.ceil(w / self.cell)),
+                max(1, math.ceil(h / self.cell)))
 
-    def _candidate_orientations(
-        self,
-        size: List[float],
-    ) -> List[Tuple[Tuple[float, float, float], int]]:
-        sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
+    # -----------------------------------------------------------------------
+    # feasibility mask  (학습 PalletizingEnv 와 동일 로직)
+    # -----------------------------------------------------------------------
+    def _mask_one(self, box: BoxInput, rot: int) -> np.ndarray:
+        lc, wc, hc = self._cells(box["size"], rot)
+        Lc, Wc = self.Lc, self.Wc
+        if lc > Lc or wc > Wc:
+            return np.zeros((Lc, Wc), dtype=np.float32)
 
-        if not self.algo.allow_rotation:
-            return [((sx, sy, sz), 0)]
+        H = self.height
+        from numpy.lib.stride_tricks import sliding_window_view
+        win_r = sliding_window_view(H, lc, axis=0).max(axis=2)
+        base = sliding_window_view(win_r, wc, axis=1).max(axis=2)
+        vr, vc = base.shape
 
-        return [
-            ((sx, sy, sz), 0),
-            ((sy, sx, sz), 90),
-        ]
+        support_cnt = np.zeros((vr, vc), dtype=np.int32)
+        corner_cnt = np.zeros((vr, vc), dtype=np.int32)
+        sum_di = np.zeros((vr, vc), dtype=np.float32)
+        sum_dj = np.zeros((vr, vc), dtype=np.float32)
+        supp_mass_min = np.full((vr, vc), np.inf, dtype=np.float32)
 
-    def _fits_current_position(
-        self,
-        dims: Tuple[float, float, float],
-    ) -> bool:
-        dx, dy, dz = dims
+        corners = {(0, 0), (lc - 1, 0), (0, wc - 1), (lc - 1, wc - 1)}
+        for di in range(lc):
+            for dj in range(wc):
+                sub = H[di:di + vr, dj:dj + vc]
+                eq = (sub == base)
+                support_cnt += eq
+                sum_di += eq * di
+                sum_dj += eq * dj
+                tm = self.topmass[di:di + vr, dj:dj + vc]
+                supp_mass_min = np.where(eq, np.minimum(supp_mass_min, tm), supp_mass_min)
+                if (di, dj) in corners:
+                    corner_cnt += eq
 
-        if self.cursor_x + dx > self.pallet.length:
-            return False
+        area = lc * wc
+        ratio = support_cnt / area
+        overflow = (base + hc) > self.Hc
+        geom = (((ratio > 0.60) & (corner_cnt >= 4)) |
+                ((ratio > 0.80) & (corner_cnt >= 3)) |
+                (ratio > 0.95))
 
-        if self.cursor_y + dy > self.pallet.width:
-            return False
+        with np.errstate(invalid="ignore"):
+            cen_di = np.where(support_cnt > 0, sum_di / np.maximum(support_cnt, 1), lc / 2.0)
+            cen_dj = np.where(support_cnt > 0, sum_dj / np.maximum(support_cnt, 1), wc / 2.0)
+        off_i = np.abs(cen_di - (lc - 1) / 2.0) / max(lc / 2.0, 1e-6)
+        off_j = np.abs(cen_dj - (wc - 1) / 2.0) / max(wc / 2.0, 1e-6)
+        m = float(box["mass"]) / self.max_mass
+        alpha = self.com_a0 + (self.com_a1 - self.com_a0) * m
+        com_ok = (off_i <= alpha) & (off_j <= alpha)
 
-        if self.layer_z + dz > self.pallet.height:
-            return False
+        floor = (base == 0)
+        safe_supp = np.where(np.isfinite(supp_mass_min), supp_mass_min, 0.0)
+        hol_ok = floor | (float(box["mass"]) <= self.k_hol * safe_supp)
 
-        return True
+        ok = (~overflow) & geom & com_ok & hol_ok
+        full = np.zeros((Lc, Wc), dtype=np.float32)
+        full[:vr, :vc] = ok.astype(np.float32)
+        return full
 
-    def _move_next_row(self) -> None:
-        self.cursor_x = 0.0
-        self.cursor_y += self.row_depth
-        self.row_depth = 0.0
+    def _feasibility_mask(self, candidates: List[Optional[BoxInput]]) -> np.ndarray:
+        M = np.zeros((self.N, 2, self.Lc, self.Wc), dtype=np.float32)
+        for ci, box in enumerate(candidates):
+            if box is None:
+                continue
+            for rot in (0, 1):
+                M[ci, rot] = self._mask_one(box, rot)
+        return M
 
-    def _move_next_layer(self) -> None:
-        self.cursor_x = 0.0
-        self.cursor_y = 0.0
-        self.layer_z += self.layer_height
-        self.row_depth = 0.0
-        self.layer_height = 0.0
+    # -----------------------------------------------------------------------
+    # 상태 텐서  (학습과 동일 채널 구성: height, topmass, 후보별 l,w,h,mass)
+    # -----------------------------------------------------------------------
+    def _build_state(self, candidates: List[Optional[BoxInput]]) -> np.ndarray:
+        Lc, Wc = self.Lc, self.Wc
+        chans = [self.height.astype(np.float32) / self.Hc,
+                 self.topmass / self.max_mass]
+        for box in candidates:
+            if box is None:
+                chans += [np.zeros((Lc, Wc), np.float32)] * 4
+            else:
+                l, w, h = box["size"]
+                chans += [np.full((Lc, Wc), l, np.float32),
+                          np.full((Lc, Wc), w, np.float32),
+                          np.full((Lc, Wc), h, np.float32),
+                          np.full((Lc, Wc), float(box["mass"]) / self.max_mass, np.float32)]
+        return np.stack(chans, axis=0)[None].astype(np.float32)   # (1, C, Lc, Wc)
 
-    def _find_position(
-        self,
-        box: BoxInput,
-    ) -> Optional[Tuple[float, float, float, Tuple[float, float, float], int]]:
-        for dims, rotation in self._candidate_orientations(box["size"]):
-            if self._fits_current_position(dims):
-                return self.cursor_x, self.cursor_y, self.layer_z, dims, rotation
+    def _decode(self, action: int) -> Tuple[int, int, int, int]:
+        per_rot = self.Lc * self.Wc
+        ci = action // (2 * per_rot)
+        rem = action % (2 * per_rot)
+        rot = rem // per_rot
+        pos = rem % per_rot
+        x, y = pos // self.Wc, pos % self.Wc
+        return ci, rot, int(x), int(y)
 
-            self._move_next_row()
+    # -----------------------------------------------------------------------
+    # 박스 적재 (height/topmass 갱신 + 출력 PlacedBox 생성)
+    # -----------------------------------------------------------------------
+    def _place(self, box: BoxInput, rot: int, x: int, y: int) -> None:
+        lc, wc, hc = self._cells(box["size"], rot)
+        region = self.height[x:x + lc, y:y + wc]
+        base = int(region.max())
+        self.height[x:x + lc, y:y + wc] = base + hc
+        self.topmass[x:x + lc, y:y + wc] = float(box["mass"])
 
-            if self._fits_current_position(dims):
-                return self.cursor_x, self.cursor_y, self.layer_z, dims, rotation
-
-            self._move_next_layer()
-
-            if self._fits_current_position(dims):
-                return self.cursor_x, self.cursor_y, self.layer_z, dims, rotation
-
-        return None
-
-    def _append_placed(
-        self,
-        box: BoxInput,
-        dims: Tuple[float, float, float],
-        rotation: int,
-        x: float,
-        y: float,
-        z: float,
-    ) -> None:
-        dx, dy, dz = dims
+        # 회전 반영한 실제 크기 (m)
+        l, w, h = float(box["size"][0]), float(box["size"][1]), float(box["size"][2])
+        if rot == 1:
+            l, w = w, l
+        # anchor(FLB) → centroid(무게중심)
+        px = x * self.cell + l / 2.0
+        py = y * self.cell + w / 2.0
+        pz = base * self.cell + h / 2.0
 
         self.sequence.append({
             "step": int(box["step"]),
             "id": int(box["id"]),
-            "size": [
-                round(dx, 3),
-                round(dy, 3),
-                round(dz, 3),
-            ],
+            "size": [round(l, 3), round(w, 3), round(h, 3)],
             "mass": float(box["mass"]),
-            "position": [
-                round(x + dx / 2.0, 3),
-                round(y + dy / 2.0, 3),
-                round(z + dz / 2.0, 3),
-            ],
-            "rotation": int(rotation),
+            "position": [round(px, 3), round(py, 3), round(pz, 3)],
+            "rotation": 90 if rot == 1 else 0,
         })
 
-        self.cursor_x += dx
-        self.row_depth = max(self.row_depth, dy)
-        self.layer_height = max(self.layer_height, dz)
-
+    # -----------------------------------------------------------------------
+    # 실행 진입점  (수정 금지 시그니처)
+    # -----------------------------------------------------------------------
     def run(self, boxes: List[BoxInput]) -> RunResult:
         self._reset_state()
 
@@ -227,50 +274,41 @@ class Palletizer:
             else:
                 current = buf.get_buffer()
 
-            if len(self.sequence) >= 20:
-                self.finished_by_user = True
-                break
-
             if self.should_finish(current):
                 self.finished_by_user = True
                 break
 
-            placed = False
+            # 후보 N개 구성 (부족하면 None 패딩)
+            candidates: List[Optional[BoxInput]] = list(current)
+            while len(candidates) < self.N:
+                candidates.append(None)
+            candidates = candidates[:self.N]
 
-            for selected_index, box in enumerate(current):
-                found = self._find_position(box)
-
-                if found is None:
-                    continue
-
-                x, y, z, dims, rotation = found
-
-                self._append_placed(
-                    box=box,
-                    dims=dims,
-                    rotation=rotation,
-                    x=x,
-                    y=y,
-                    z=z,
-                )
-
-                if self.algo.buffer_size == 0:
-                    buf.pop_next()
-                else:
-                    buf.pop_selected(selected_index)
-
-                placed = True
+            # feasibility mask → 전부 0이면 종료
+            mask = self._feasibility_mask(candidates)
+            if mask.sum() == 0:
+                self.finished = True
+                if current:
+                    self.terminated_step = int(current[0]["step"])
                 break
 
-            if placed:
-                continue
+            # ONNX 추론 → mask 적용 → argmax → 디코드
+            state = self._build_state(candidates)
+            logits, _ = self.sess.run(["logits", "value"], {"state": state})
+            logits = np.asarray(logits).reshape(-1)
+            mask_flat = mask.reshape(-1)
+            masked = np.where(mask_flat > 0, logits, -1e30)
+            action = int(masked.argmax())
+            ci, rot, x, y = self._decode(action)
 
-            self.finished = True
+            box = candidates[ci]
+            self._place(box, rot, x, y)
 
-            if current:
-                self.terminated_step = int(current[0]["step"])
-
-            break
+            # 선택한 후보 소비 (버퍼에서 pop → 자동 보충)
+            if self.algo.buffer_size == 0:
+                buf.pop_next()
+            else:
+                buf.pop_selected(ci)
 
         return {
             "buffer_size": self.algo.buffer_size,

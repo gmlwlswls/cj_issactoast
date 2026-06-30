@@ -1,0 +1,14 @@
+{
+  "onnx_path": "DRL_cnn_model_B1.onnx",
+  "buffer_B": 1,
+  "in_ch": 6,
+  "N": 1,
+  "Lc": 120,
+  "Wc": 100,
+  "Hc": 125,
+  "cell": 0.01,
+  "max_mass": 6.0,
+  "k_hol": 1.8,
+  "com_alpha0": 0.45,
+  "com_alpha1": 0.2
+}
