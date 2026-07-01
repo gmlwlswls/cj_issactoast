@@ -12,7 +12,7 @@ model_learn.py
         - 무거운 박스를 낮게 두도록 하는 작은 CoG 소프트 보상항 추가(논문엔 없음).
   (B) 후보 선택 방식:
         - 논문은 "버퍼 최선참 1개 + 컨베이어 1개 중 랜덤 선택"이지만,
-          여기서는 "버퍼 내 모든 박스"를 전부 상태로 입력하고,
+          여기서는 "버퍼 내 모든 박스 + 컨베이어 1개"를 전부 상태로 입력하고,
           네트워크가 (어느 박스 / 어느 회전 / 어디에) 를 한 번에 출력해 최선을 고른다.
 
 상태(state) 채널 구성 (Lc x Wc 격자, 1cm 단위):
@@ -89,8 +89,9 @@ class Config:
     val_every = 200                   # 검증 주기(에피소드)
     val_size = 32                     # 검증 시퀀스 수(고정)
     patience = 10                     # early stopping: 검증 개선 없는 횟수 한도
-    save_root = "./best_model_by_buffer"   # 버퍼별 모델을 모아둘 상위 폴더
-    save_dir = "./best_model_by_buffer/DRL_cnn_model_B4"  # 실제 저장 경로(B에 맞춰 설정)
+    save_root = "./best_model_by_buffer"   # 버퍼별 모델 파일을 모아둘 폴더
+    model_path = "./best_model_by_buffer/DRL_cnn_model_B4.pt"   # B에 맞춰 설정됨
+    onnx_path = "./best_model_by_buffer/DRL_cnn_model_B4.onnx"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -359,7 +360,7 @@ def train(cfg):
     net = ActorCritic(in_ch, env.N, cfg.Lc, cfg.Wc).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr)
 
-    os.makedirs(cfg.save_dir, exist_ok=True)
+    os.makedirs(cfg.save_root, exist_ok=True)
     rng = np.random.default_rng(SEED)
     best_val, no_improve = -1.0, 0
 
@@ -414,18 +415,20 @@ def train(cfg):
                   f"util={util:.4f} total={total_score:.2f} best={max(best_val,0):.2f}")
             if total_score > best_val:
                 best_val, no_improve = total_score, 0
-                torch.save({"state_dict": net.state_dict(), "cfg": vars(cfg),
+                full_cfg = {k: getattr(Config, k) for k in dir(Config) if not k.startswith("_")}
+                full_cfg.update(vars(cfg))
+                torch.save({"state_dict": net.state_dict(), "cfg": full_cfg,
                             "util": util, "total_score": total_score,
                             "buffer_B": cfg.buffer_B, "in_ch": in_ch, "N": env.N},
-                           os.path.join(cfg.save_dir, "best_model.pt"))
+                           cfg.model_path)
                 _export_onnx(net, in_ch, cfg, device)
-                print(f"   ↳ best 갱신 → {cfg.save_dir}/ 저장 (util={util:.4f}, total={total_score:.2f})")
+                print(f"   ↳ best 갱신 → {cfg.model_path} 저장 (util={util:.4f}, total={total_score:.2f})")
             else:
                 no_improve += 1
                 if no_improve >= cfg.patience:
                     print(f"[early stopping] {cfg.patience}회 개선 없음 → 종료 (best total={best_val:.2f})")
                     break
-    print(f"학습 종료. best total_score={best_val:.2f} (B={cfg.buffer_B}), 모델 경로={cfg.save_dir}/")
+    print(f"학습 종료. best total_score={best_val:.2f} (B={cfg.buffer_B}), 모델 파일={cfg.model_path}")
     return best_val
 
 
@@ -434,7 +437,7 @@ def _export_onnx(net, in_ch, cfg, device):
     try:
         net.eval()
         dummy = torch.zeros(1, in_ch, cfg.Lc, cfg.Wc, device=device)
-        torch.onnx.export(net, dummy, os.path.join(cfg.save_dir, "policy.onnx"),
+        torch.onnx.export(net, dummy, cfg.onnx_path,
                           input_names=["state"], output_names=["logits", "value"],
                           dynamic_axes={"state": {0: "batch"}}, opset_version=17,
                           dynamo=False)
@@ -450,7 +453,8 @@ def _make_cfg(args, buffer_B):
     cfg.fixed_ratio = args.fixed_ratio
     cfg.max_episodes = args.max_episodes
     cfg.save_root = args.save_root
-    cfg.save_dir = os.path.join(args.save_root, f"DRL_cnn_model_B{buffer_B}")
+    cfg.model_path = os.path.join(args.save_root, f"DRL_cnn_model_B{buffer_B}.pt")
+    cfg.onnx_path = os.path.join(args.save_root, f"DRL_cnn_model_B{buffer_B}.onnx")
     return cfg
 
 
@@ -493,7 +497,7 @@ if __name__ == "__main__":
             print(f"  B={B:>2} → best total_score = {results[B]:.2f}")
         best_B = max(results, key=results.get)
         print(f"\n>>> 최적 버퍼 크기 B = {best_B} (총점 {results[best_B]:.2f})")
-        print(f">>> 해당 모델: {os.path.join(args.save_root, f'DRL_cnn_model_B{best_B}')}/best_model.pt")
+        print(f">>> 해당 모델: {os.path.join(args.save_root, f'DRL_cnn_model_B{best_B}.pt')}")
     else:
         # ── 단일 B 학습 ────────────────────────────────────────────
         cfg = _make_cfg(args, args.buffer_B)

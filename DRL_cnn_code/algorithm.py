@@ -101,11 +101,17 @@ class Palletizer:
         self.N = int(meta.get("N", self.algo.buffer_size))     # 후보 수 = 버퍼 크기
 
         # ---- ONNX 세션 ----
+        # 1) meta 에 지정된 이름이 실제로 있으면 그걸 사용
+        # 2) 없으면 같은 폴더의 .onnx 파일을 자동 탐색 (이름 안 맞춰도 됨)
         onnx_path = os.path.join(here, onnx_name)
         if not os.path.exists(onnx_path):
-            raise FileNotFoundError(
-                f"ONNX 모델을 찾을 수 없습니다: {onnx_path}\n"
-                f"export_onnx.py 로 .pt → .onnx 변환 후, model_meta.json 과 함께 두세요.")
+            found = [f for f in os.listdir(here) if f.lower().endswith(".onnx")]
+            if found:
+                onnx_path = os.path.join(here, sorted(found)[0])
+            else:
+                raise FileNotFoundError(
+                    f"ONNX 모델을 찾을 수 없습니다: {here} 폴더에 .onnx 파일이 없습니다.\n"
+                    f"export_onnx.py 로 .pt → .onnx 변환 후, 이 폴더에 두세요.")
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
 
         self._reset_state()
