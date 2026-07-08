@@ -1,0 +1,21 @@
+input_path: box_sequence
+output_dir: algorithm_results
+
+pallet:
+  length: 1.2
+  width: 1.0
+  height: 1.25
+
+json:
+  indent: 2
+  ensure_ascii: false
+
+algorithm:
+  allow_rotation: true            # 박스 Z축 기준 90도 회전 허용 여부
+############# 아래는 사용자가 입력하는 설정값입니다. #############
+buffer:
+  size: 0                        # 버퍼 슬롯 수, 동시에 대기 가능한 박스 수
+
+
+
+

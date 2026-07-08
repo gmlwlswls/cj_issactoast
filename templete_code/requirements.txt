@@ -6,7 +6,7 @@ protobuf==7.34.1
 flatbuffers==25.12.19
 typing_extensions==4.15.0
 
-# Visualization (í•„ìš”ì‹œë§Œ)
+# Visualization (ÇÊ¿ä½Ã¸¸)
 matplotlib==3.10.8
 pillow==12.2.0
 contourpy==1.3.3
@@ -18,6 +18,6 @@ pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 six==1.17.0
 
-# Utility (ì‹¤ì œ ì‚¬ìš©í•˜ëŠ”ì§€ í™•ì¸)
+# Utility (½ÇÁ¦ »ç¿ëÇÏ´ÂÁö È®ÀÎ)
 PyYAML==6.0.3
 ml_dtypes==0.5.4
