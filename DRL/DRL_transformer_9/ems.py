@@ -85,8 +85,12 @@ class EMSManager:
         self.spaces = self._maximal_filter(new_spaces)
 
     def get_sorted_spaces(self) -> List[Space]:
-        """XYZ 우선순위로 정렬 (X 작은 것 → Y 작은 것 → Z 낮은 것 우선)."""
-        return sorted(self.spaces, key=lambda s: (s[0], s[1], s[2]))
+        """
+        Z 우선 정렬 (낮은 층부터 채운다) → 그 다음 XY (왼쪽·앞쪽).
+        원 논문의 XYZ 는 EMS 가 잘게 쪼개진 오프라인 환경 가정인데,
+        큰 팔레트 + 온라인 환경에서는 Z-first 가 탑 쌓기 방지에 유리.
+        """
+        return sorted(self.spaces, key=lambda s: (s[2], s[0], s[1]))
 
     def can_fit(self, space: Space, dims: Tuple[float, float, float]) -> bool:
         """dims=(l,w,h) 가 space 안에 들어가는지."""

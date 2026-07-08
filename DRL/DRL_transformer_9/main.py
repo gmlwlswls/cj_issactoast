@@ -1,3 +1,6 @@
+# 단일 B 학습: python model_learn_v2.py --buffer_B 1
+# 버퍼 sweep: python model_learn_v2.py --buffers 1,5,10
+
 from __future__ import annotations
 
 import json

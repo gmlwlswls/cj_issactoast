@@ -453,6 +453,8 @@ def _make_cfg(args, buffer_B):
     cfg.buffer_B = buffer_B
     cfg.fixed_ratio = args.fixed_ratio
     cfg.max_episodes = args.max_episodes
+    cfg.val_every = args.val_every
+    cfg.patience = args.patience
     cfg.save_root = args.save_root
     cfg.model_path = os.path.join(args.save_root, f"DRL_cnn_model_B{buffer_B}.pt")
     cfg.onnx_path = os.path.join(args.save_root, f"DRL_cnn_model_B{buffer_B}.onnx")
@@ -480,6 +482,10 @@ if __name__ == "__main__":
     p.add_argument("--max_episodes", type=int, default=Config.max_episodes)
     p.add_argument("--save_root", default=Config.save_root,
                    help="버퍼별 모델 상위 폴더 (하위에 DRL_cnn_model_B{B} 로 저장)")
+    p.add_argument("--val_every", type= int, default=Config.val_every,
+                   help='검증 주기(episode)')
+    p.add_argument('--patience', type= int, default= Config.patience,
+                   help= 'early stopping patience(개선 없는 횟수)')
     args = p.parse_args()
 
     if args.buffers:
