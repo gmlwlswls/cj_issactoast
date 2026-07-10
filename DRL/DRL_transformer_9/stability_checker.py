@@ -1,9 +1,10 @@
 """
-stability_checker.py — 물리 안정성 검사
+stability_checker.py — 물리 안정성 검사 (강화 조건)
 ==============================================================================
-논문 9번(O4M-SP)의 Stability Checker 구현.
-  - 지지 제약 (r_s): 밑면의 r_s 이상이 받쳐져야 함 (기본 0.66)
-  - 무게 제약 (r_w): 위 박스 무게 ≤ r_w × 아래 박스 무게 (기본 3.0)
+논문 9번(O4M-SP) 기반 + 강화:
+  - 지지 제약 (r_s): 밑면의 r_s 이상이 받쳐져야 함 (강화: 0.75)
+  - 무게 제약 (r_w): 위 박스 무게 ≤ r_w × 아래 박스 무게 (강화: 2.0)
+  - 모서리 제약: 네 모서리 중 min_corners 개 이상 지지되어야 함 (강화: 3)
 
 height map (Lc×Wc 정수 격자) 기반으로 검사한다.
 """
@@ -22,21 +23,23 @@ class PlaceResult:
 
 class StabilityChecker:
     """
-    물리적 제약(간이) 체크 + height/topmass map 유지.
+    물리적 제약(강화) 체크 + height/topmass map 유지.
 
-    - 지지 제약: 지지 면적 / 바닥 면적 >= r_s
-      여기서 "지지"는 footprint 내에서 base 높이에 닿아있는 셀(=최대 높이 평탄 지지)로 근사.
-    - 무게 제약: 배치 박스 mass <= r_w * (지지 셀들 아래의 topmass 중 최소값)
-      (바닥(base==0)이면 무게 제약은 항상 통과로 처리)
+    - 지지 제약: 지지 면적 / 바닥 면적 >= r_s  (기본 0.75)
+    - 모서리 제약: 네 모서리(0,0)(lc-1,0)(0,wc-1)(lc-1,wc-1) 중 min_corners 개 이상 지지
+    - 무게 제약: 배치 박스 mass <= r_w * (지지 셀들 아래 topmass 중 최소)  (기본 2.0)
+      (바닥(base==0)이면 지지·무게 제약 모두 통과)
     """
 
-    def __init__(self, Lc: int, Wc: int, Hc: int, cell: float, r_s: float = 0.66, r_w: float = 3.0):
+    def __init__(self, Lc: int, Wc: int, Hc: int, cell: float,
+                 r_s: float = 0.75, r_w: float = 2.0, min_corners: int = 3):
         self.Lc = int(Lc)
         self.Wc = int(Wc)
         self.Hc = int(Hc)
         self.cell = float(cell)
         self.r_s = float(r_s)
         self.r_w = float(r_w)
+        self.min_corners = int(min_corners)
 
         self.height = np.zeros((self.Lc, self.Wc), dtype=np.int32)
         self.topmass = np.zeros((self.Lc, self.Wc), dtype=np.float32)
@@ -64,28 +67,37 @@ class StabilityChecker:
         xc, yc = self._anchor_to_cell(x, y, lc, wc)
 
         region = self.height[xc:xc + lc, yc:yc + wc]
+        if region.size == 0:
+            return False
         base = int(region.max())
         if base + hc > self.Hc:
             return False
 
-        # 지지율: footprint 중 base 높이와 같은 셀의 비율(평탄 지지 근사)
+        # 바닥이면 모든 제약 통과
+        if base == 0:
+            return True
+
+        # 지지 셀(같은 base 높이) 판정
         support = (region == base)
         r_support = float(support.mean()) if support.size > 0 else 0.0
         if r_support < self.r_s:
             return False
 
-        # 무게비: 바닥이면 OK, 아니면 지지 셀 아래 topmass 최소와 비교
-        if base == 0:
-            return True
+        # 모서리 조건: 네 모서리 중 min_corners 개 이상 지지
+        corner_ok = 0
+        for (ci, cj) in [(0, 0), (lc - 1, 0), (0, wc - 1), (lc - 1, wc - 1)]:
+            if support[ci, cj]:
+                corner_ok += 1
+        if corner_ok < self.min_corners:
+            return False
 
+        # 무게 제약: 지지 셀 아래 topmass 최소와 비교
         tm = self.topmass[xc:xc + lc, yc:yc + wc]
         if support.any():
             supp_min = float(np.min(tm[support]))
         else:
             return False
-
-        # 지지체가 "빈 topmass(0)"이면 무게비가 무조건 깨지도록 처리(떠있는 상황 방지)
-        if supp_min <= 0.0:
+        if supp_min <= 0.0:      # 지지체가 "빈 topmass(0)"이면 떠있는 상황 방지
             return False
 
         return float(mass) <= self.r_w * supp_min

@@ -70,9 +70,10 @@ class Palletizer:
 
         here = os.path.dirname(os.path.abspath(__file__))
 
-        # ---- 메타 로드 ----
+        # ---- 메타 로드 (강화 조건 기본값) ----
         meta_path = os.path.join(here, "model_meta.json")
-        meta = {"cell": 0.01, "r_s": 0.66, "r_w": 3.0, "buffer_B": algo_cfg.buffer_size}
+        meta = {"cell": 0.01, "r_s": 0.75, "r_w": 2.0, "min_corners": 3,
+                "buffer_B": algo_cfg.buffer_size, "sort_order": "z_first"}
         onnx_name = "model.onnx"
         if os.path.exists(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
@@ -83,6 +84,8 @@ class Palletizer:
         self.cell = float(meta["cell"])
         self.r_s = float(meta["r_s"])
         self.r_w = float(meta["r_w"])
+        self.min_corners = int(meta.get("min_corners", 3))
+        self.sort_order = str(meta.get("sort_order", "z_first"))
         self.buffer_B = int(meta.get("buffer_B", algo_cfg.buffer_size))
 
         # 격자 크기
@@ -100,9 +103,11 @@ class Palletizer:
             onnx_path = os.path.join(here, sorted(found)[0])
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
 
-        # EMS, Stability
+        # EMS, Stability (강화된 min_corners 반영)
         self.ems = EMSManager(self.pallet.length, self.pallet.width, self.pallet.height)
-        self.stab = StabilityChecker(self.Lc, self.Wc, self.Hc, self.cell, self.r_s, self.r_w)
+        self.stab = StabilityChecker(self.Lc, self.Wc, self.Hc, self.cell,
+                                     r_s=self.r_s, r_w=self.r_w,
+                                     min_corners=self.min_corners)
 
         self._reset_state()
 
@@ -137,9 +142,21 @@ class Palletizer:
     # -----------------------------------------------------------------------
     # 상태 텐서 구성 (학습과 동일)
     # -----------------------------------------------------------------------
+    def _sorted_spaces_by_order(self):
+        """
+        학습 시(model_learn9)와 동일한 정렬 순서를 사용한다.
+        - z_first (기본): (z, x, y)  → 낮은 층부터 채움 (큰 팔레트에서 탑 쌓기 방지)
+        - x_first: (x, y, z)         → 원 논문(오프라인 가정)
+        """
+        spaces = list(self.ems.spaces)
+        if self.sort_order == "x_first":
+            return sorted(spaces, key=lambda s: (s[0], s[1], s[2]))
+        # 기본 z_first
+        return sorted(spaces, key=lambda s: (s[2], s[0], s[1]))
+
     def _find_current_space(self, current_buffer):
-        """EMS 중 버퍼 박스가 들어가고 안정한 첫 공간."""
-        for sp in self.ems.get_sorted_spaces():
+        """EMS 중 버퍼 박스가 들어가고 안정한 첫 공간 (강화 조건 적용)."""
+        for sp in self._sorted_spaces_by_order():
             for box in current_buffer:
                 if not self._valid_box(box): continue
                 l, w, h = box["size"]; mass = box["mass"]
