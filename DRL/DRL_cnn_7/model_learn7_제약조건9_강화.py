@@ -93,9 +93,9 @@ class Config:
     val_every = 200                   # 검증 주기(에피소드)
     val_size = 32                     # 검증 시퀀스 수(고정)
     patience = 10                     # early stopping: 검증 개선 없는 횟수 한도
-    save_root = "./best_model_by_buffer_7_제약조건9"   # 버퍼별 모델 파일을 모아둘 폴더
-    model_path = "./best_model_by_buffer_7_제약조건9/DRL_cnn_model_B4.pt"   # B에 맞춰 설정됨
-    onnx_path = "./best_model_by_buffer_7_제약조건9/DRL_cnn_model_B4.onnx"
+    save_root = "./best_model_by_buffer_7_강화제약조건9"   # 버퍼별 모델 파일을 모아둘 폴더
+    model_path = "./best_model_by_buffer_7_강화제약조건9/DRL_cnn_model_B4.pt"   # B에 맞춰 설정됨
+    onnx_path = "./best_model_by_buffer_7_강화제약조건9/DRL_cnn_model_B4.onnx"
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -33,8 +33,12 @@ model_learn_v2.py — O4M-SP 스타일(9번 논문 요약 기반) PPO 학습 스
      torch.export(및 이를 사용하는 torch.onnx.export)가 실패했음. 조건문을 제거하고
      logits/value에 nan_to_num을 항상(unconditional) 적용하도록 수정 (원식과 동일한
      방어 효과, export 호환).
-  5) 학습 하이퍼파라미터 조정: lr 시작값 3e-5(기존 1e-4), warmup 100iter(기존 20),
-     val_size 64(기존 10000).
+  5) 학습 하이퍼파라미터: lr 시작값 3e-5, warmup 100iter, val_size 64.
+  6) r_HD 보상을 논문 원식대로 재구현:
+       r_HD = (H_t − H_t') − (H_{t-1} − H_{t-1}')   (H: 놓기 전, H': 놓은 후 높이표준편차)
+     이전 스텝의 (H_{t-1} − H_{t-1}')을 self.prev_delta_h에 저장해 다음 스텝 계산에 사용.
+     에피소드 첫 배치는 H_t(=h_before)가 항상 0에서 시작해 delta가 비정상적으로 튀므로
+     r_hd=0으로 예외 처리(단, prev_delta_h 갱신은 정상적으로 수행해 다음 스텝 계산에 반영).
   - EMS 정렬은 X>Y>Z를 그대로 유지 (합의: 우선 이대로 학습해보고 결과를 본 뒤 재검토).
 ==============================================================================
 """
@@ -313,7 +317,8 @@ class PackingEnv:
         self.placed = []
         self.placed_vol = 0.0
         self.prev_util = 0.0
-        self.prev_improvement = 0.0
+        # r_HD = (H_t - H_t') - (H_{t-1} - H_{t-1}') 계산용: 직전 스텝의 (놓기 전 - 놓은 후) 높이차 저장
+        self.prev_delta_h = 0.0
 
         self._cached_decision: Optional[CurrentDecision] = None
 
@@ -332,7 +337,7 @@ class PackingEnv:
         self.placed = []
         self.placed_vol = 0.0
         self.prev_util = 0.0
-        self.prev_improvement = 0.0
+        self.prev_delta_h = 0.0
         self._cached_decision = None
 
         return self._obs()
@@ -465,6 +470,12 @@ class PackingEnv:
         sp = decision.space
         sx, sy = sp[0], sp[1]
 
+        # r_HD 계산용: 이번 스텝에서 박스를 "놓기 전" 상태를 미리 기록해 둔다.
+        #   - is_first_placement: 에피소드의 첫 배치인지 여부 (아래 예외 처리에 사용)
+        #   - h_before = H_t : 놓기 전 높이(표준편차, 정규화)
+        is_first_placement = (len(self.placed) == 0)
+        h_before = self.stab.get_height_std() / max(1, self.Hc)
+
         # 안정성 체크는 이미 통과했다고 가정. place 후 base(cell)를 받는다.
         pr = self.stab.place(sx, sy, (l, w, h), mass)
         bz = pr.base * self.cell
@@ -494,13 +505,26 @@ class PackingEnv:
         cur_util_abs = self.placed_vol / pallet_vol
         r_lr = cur_util_abs - self.prev_util
 
-        h_std = self.stab.get_height_std() / max(1, self.Hc)
-        cur_imp = -h_std
-        r_hd = cur_imp - self.prev_improvement
+        # r_HD = (H_t - H_t') - (H_{t-1} - H_{t-1}')
+        #   H_t  = h_before (이번 배치 "놓기 전" 높이표준편차, 위에서 미리 기록)
+        #   H_t' = h_after  (이번 배치 "놓은 후"   높이표준편차)
+        #   delta_h_t = H_t - H_t' : 이번 배치로 인한 높이(표준편차) 변화량
+        #   r_HD = 이번 배치의 변화량 - 직전 배치의 변화량(self.prev_delta_h)
+        h_after = self.stab.get_height_std() / max(1, self.Hc)
+        delta_h_t = h_before - h_after
+
+        if is_first_placement:
+            # 에피소드 첫 배치는 h_before(H_t)가 항상 0에서 시작해 delta_h_t가
+            # 비정상적으로 튀므로(직전 배치가 없어 비교 기준도 없음) r_hd=0으로 예외 처리.
+            # 다음 스텝의 r_HD 계산을 위해 delta_h_t 자체는 prev_delta_h에 정상 저장한다.
+            r_hd = 0.0
+        else:
+            r_hd = delta_h_t - self.prev_delta_h
+
+        self.prev_delta_h = delta_h_t
 
         reward = float(np.clip(self.alpha_lr * r_lr + self.alpha_hd * r_hd, -1.0, 1.0))
         self.prev_util = cur_util_abs
-        self.prev_improvement = cur_imp
 
         obs = self._obs()
         done = (obs[3].sum() == 0.0) or (len(self.buffer) == 0 and self.ptr >= len(self.seq))
@@ -591,8 +615,8 @@ def export_meta(save_root: str, buffer_B: int):
         "cell": 0.01,
         "r_s": 0.75,             # 강화 조건
         "r_w": 2.0,              # 강화 조건
-        "min_corners": 3,        # 강화 조건 (네 모서리 중 3개 이상)
-        "sort_order": "z_first", # EMS 정렬: z → x → y
+        "min_corners": 3,        # 강화 조건
+        "sort_order": "z_first", # EMS 정렬
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -672,9 +696,9 @@ def train(
     fixed_ratio: float = 0.5,
     n_boxes: int = 250,
     # optim/schedule
-    lr: float = 3e-5,
+    lr: float = 3e-5,            # 우리 환경: 1e-4 는 초기 폭주 위험 → 3e-5 로 낮춤
     min_lr: float = 1e-6,
-    warmup: int = 100,
+    warmup: int = 100,           # 100 iter 선형 warmup (초기 NaN 방지)
     # ppo
     gamma: float = 0.99,
     lam: float = 0.95,
@@ -684,7 +708,7 @@ def train(
     ppo_epochs: int = 4,
     # validate/early stop
     val_every: int = 20,
-    val_size: int = 64,
+    val_size: int = 64,           # 논문 원본 10000 은 우리 환경에 과함 → 64 로
     patience: int = 100,
 ):
     set_seed(SEED)
