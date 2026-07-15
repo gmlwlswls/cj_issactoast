@@ -61,7 +61,7 @@ class AlgorithmConfig:
     buffer_size: int
 
 
-_DEFAULTS = dict(cell=0.01, max_mass=6.0, k_hol=1.8, com_alpha0=0.45, com_alpha1=0.20,
+_DEFAULTS = dict(cell=0.01, max_mass=6.0,
                   use_anchor_filter=True, anchor_use_boundary=True, anchor_use_box_edges=True)
 
 
@@ -83,9 +83,6 @@ class Palletizer:
 
         self.cell = float(meta["cell"])
         self.max_mass = float(meta["max_mass"])
-        self.k_hol = float(meta["k_hol"])
-        self.com_a0 = float(meta["com_alpha0"])
-        self.com_a1 = float(meta["com_alpha1"])
         self.use_anchor_filter = bool(meta["use_anchor_filter"])
         self.anchor_use_boundary = bool(meta["anchor_use_boundary"])
         self.anchor_use_box_edges = bool(meta["anchor_use_box_edges"])
@@ -93,6 +90,7 @@ class Palletizer:
         self.Lc = int(round(self.pallet.length / self.cell))
         self.Wc = int(round(self.pallet.width / self.cell))
         self.Hc = int(round(self.pallet.height / self.cell))
+        self.N = int(meta.get("N", max(1, self.algo.buffer_size)))
 
         onnx_path = os.path.join(here, onnx_name)
         if not os.path.exists(onnx_path):
@@ -102,27 +100,7 @@ class Palletizer:
             onnx_path = os.path.join(here, sorted(found)[0])
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
 
-        # N(상태 텐서 슬롯 수)은 ONNX 그래프의 실제 입력 채널 수(C = 2 + 4*N)에서
-        # 직접 역산한다. buffer_size나 model_meta.json의 N을 그대로 신뢰하지 않는
-        # 이유: _build_state_single이 항상 슬롯0만 채우므로 N은 buffer_size와
-        # 무관하게 "학습된 그래프가 원래 기대하는 채널 수"로 고정돼야 한다.
-        # (예전 버그: N을 buffer_size로 fallback시켜서, B=1 모델을 buffer_size=5
-        #  로 돌리면 상태 채널 수가 안 맞아 ONNX 추론이 매번 예외로 실패했음.)
-        self.N = self._infer_state_slots(meta)
-
         self._reset_state()
-
-    def _infer_state_slots(self, meta) -> int:
-        """ONNX 입력(state) 텐서 shape에서 N을 역산. 실패 시에만 meta의 N,
-        그마저 없으면 1로 고정한다 — buffer_size는 절대 fallback으로 쓰지 않음."""
-        try:
-            shp = self.sess.get_inputs()[0].shape   # 보통 [batch, C, Lc, Wc]
-            C = shp[1]
-            if isinstance(C, int) and C >= 6 and (C - 2) % 4 == 0:
-                return (C - 2) // 4
-        except Exception:
-            pass
-        return int(meta.get("N", 1))
 
     # -----------------------------------------------------------------------
     # 상태 관리
@@ -131,8 +109,6 @@ class Palletizer:
         self.height = np.zeros((self.Lc, self.Wc), dtype=np.int32)
         self.topmass = np.zeros((self.Lc, self.Wc), dtype=np.float32)
         # anchor(모서리 밀착) 후보용 — 학습 스크립트(model_learn7)와 동일 규칙.
-        # 크기를 Lc+1/Wc+1로 잡아 박스 오른쪽/윗쪽 모서리(x+lc, y+wc)가 팔레트 끝에
-        # 딱 붙는 경우까지 인덱싱 오류 없이 기록한다.
         self._edge_x = np.zeros(self.Lc + 1, dtype=bool)
         self._edge_y = np.zeros(self.Wc + 1, dtype=bool)
         self.sequence: List[PlacedBox] = []
@@ -176,50 +152,43 @@ class Palletizer:
         vr, vc = base.shape
 
         support_cnt = np.zeros((vr, vc), dtype=np.int32)
-        corner_cnt = np.zeros((vr, vc), dtype=np.int32)
+        corner_cnt = np.zeros((vr, vc), dtype=np.int32)              # 네 모서리 지지 카운트
         supp_mass_min = np.full((vr, vc), np.inf, dtype=np.float32)
-        sum_di = np.zeros((vr, vc), dtype=np.float32)
-        sum_dj = np.zeros((vr, vc), dtype=np.float32)
 
+        # 네 모서리 상대 좌표
         corners = {(0, 0), (lc - 1, 0), (0, wc - 1), (lc - 1, wc - 1)}
+
         for di in range(lc):
             for dj in range(wc):
                 sub = H[di:di + vr, dj:dj + vc]
                 eq = (sub == base)
                 support_cnt += eq
-                sum_di += eq * di
-                sum_dj += eq * dj
                 tm = self.topmass[di:di + vr, dj:dj + vc]
                 supp_mass_min = np.where(eq, np.minimum(supp_mass_min, tm), supp_mass_min)
                 if (di, dj) in corners:
                     corner_cnt += eq
 
         area = lc * wc
-        ratio = support_cnt / area
+
+        # (2) 높이 초과
         overflow = (base + hc) > self.Hc
-        geom = (((ratio > 0.60) & (corner_cnt >= 4)) |
-                ((ratio > 0.80) & (corner_cnt >= 3)) |
-                (ratio > 0.95))
 
-        with np.errstate(invalid="ignore"):
-            cen_di = np.where(support_cnt > 0, sum_di / np.maximum(support_cnt, 1), lc / 2.0)
-            cen_dj = np.where(support_cnt > 0, sum_dj / np.maximum(support_cnt, 1), wc / 2.0)
-        off_i = np.abs(cen_di - (lc - 1) / 2.0) / max(lc / 2.0, 1e-6)
-        off_j = np.abs(cen_dj - (wc - 1) / 2.0) / max(wc / 2.0, 1e-6)
-        m = float(box["mass"]) / self.max_mass
-        alpha = self.com_a0 + (self.com_a1 - self.com_a0) * m
-        com_ok = (off_i <= alpha) & (off_j <= alpha)
-
+        # (3) 지지 기하 (강화 조건):
+        #     면적 지지율 >= 75%  AND  네 모서리 중 3개 이상 지지
+        #     바닥(base == 0)이면 무조건 통과.
         floor = (base == 0)
-        safe_supp = np.where(np.isfinite(supp_mass_min), supp_mass_min, 0.0)
-        hol_ok = floor | (float(box["mass"]) <= self.k_hol * safe_supp)
+        geom = floor | ((support_cnt >= 0.75 * area) & (corner_cnt >= 3))
 
-        ok = (~overflow) & geom & com_ok & hol_ok
+        # (4) CoM 마진 → 제거
+
+        # (5) heavy-on-light (강화): 배치 박스 질량 <= 2 × 최소 지지 박스 질량
+        safe_supp = np.where(np.isfinite(supp_mass_min), supp_mass_min, 0.0)
+        hol_ok = floor | (float(box["mass"]) <= 2.0 * safe_supp)
+
+        ok = (~overflow) & geom & hol_ok
 
         # anchor(모서리 밀착) 필터: 벽/기존 박스 모서리에 붙는 위치만 남기고,
-        # 그런 위치가 하나도 없으면(전멸) 원래 ok로 폴백한다. Phase1의 후보 풀
-        # 자체를 여기서 좁히기 때문에, CNN의 raw top-K 안에 없던 위치도
-        # (물리적으로 유효하기만 하면) 항상 후보에 남는다.
+        # 전멸하면 원래 ok로 폴백한다.
         if self.use_anchor_filter:
             anchor = self._anchor_mask_2d(lc, wc, vr, vc)
             restricted = ok & anchor
@@ -285,212 +254,90 @@ class Palletizer:
         x, y = pos // self.Wc, pos % self.Wc
         return ci, rot, int(x), int(y)
 
-    # =====================================================================
-    #  Phase 1 헬퍼: CNN + Anchor 재순위
-    # =====================================================================
+    # -----------------------------------------------------------------------
+    # Anchor 기반 후보 재순위 (CNN top-K 중 배치 박스에 가장 밀착되는 위치 선택)
+    # -----------------------------------------------------------------------
     def _contact_score(self, rot, x, y, box):
+        """
+        (rot, x, y) 위치에 box 를 놓았을 때 기존 구조물 및 팔레트 벽과의
+        접촉 점수를 계산. 높을수록 빈틈 없이 밀착된 배치.
+        """
         lc, wc, hc = self._cells(box["size"], rot)
         Lc, Wc, Hc = self.Lc, self.Wc, self.Hc
         H = self.height
-        base = int(H[x:x+lc, y:y+wc].max())
+
+        base = int(H[x:x + lc, y:y + wc].max())
         score = 0.0
-        p = max(1, 2*(lc+wc))
-        if x == 0:       score += lc/p
-        if x+lc >= Lc:   score += lc/p
-        if y == 0:        score += wc/p
-        if y+wc >= Wc:   score += wc/p
-        if x > 0:         score += ((H[x-1, y:y+wc] >= base) & (H[x-1, y:y+wc] > 0)).sum()/p
-        if x+lc < Lc:    score += ((H[x+lc, y:y+wc] >= base) & (H[x+lc, y:y+wc] > 0)).sum()/p
-        if y > 0:         score += ((H[x:x+lc, y-1] >= base) & (H[x:x+lc, y-1] > 0)).sum()/p
-        if y+wc < Wc:    score += ((H[x:x+lc, y+wc] >= base) & (H[x:x+lc, y+wc] > 0)).sum()/p
-        score += (1.0 - base/Hc) * 0.5
+        perimeter = 2 * (lc + wc)
+
+        if x == 0:          score += lc / perimeter
+        if x + lc >= Lc:    score += lc / perimeter
+        if y == 0:          score += wc / perimeter
+        if y + wc >= Wc:    score += wc / perimeter
+
+        if x > 0:
+            col = H[x - 1, y:y + wc]
+            score += ((col >= base) & (col > 0)).sum() / perimeter
+        if x + lc < Lc:
+            col = H[x + lc, y:y + wc]
+            score += ((col >= base) & (col > 0)).sum() / perimeter
+        if y > 0:
+            row = H[x:x + lc, y - 1]
+            score += ((row >= base) & (row > 0)).sum() / perimeter
+        if y + wc < Wc:
+            row = H[x:x + lc, y + wc]
+            score += ((row >= base) & (row > 0)).sum() / perimeter
+
+        score += (1.0 - base / Hc) * 0.5
         return score
 
-    # =====================================================================
-    #  Phase 2: 바닥 갭 채우기
-    #   height=0 인 빈 바닥에 박스를 Z=0 으로 배치. 물리 조건 없음.
-    #   접촉 점수로 기존 박스에 밀착된 위치 선호.
-    # =====================================================================
-    def _phase2_floor_gap(self, box):
-        from numpy.lib.stride_tricks import sliding_window_view
-        H = self.height
-        best_result = None
-        best_contact = -1.0
-
-        for rot in (0, 1):
-            lc, wc, hc = self._cells(box["size"], rot)
-            if lc > self.Lc or wc > self.Wc or hc > self.Hc:
-                continue
-            win_r = sliding_window_view(H, lc, axis=0).max(axis=2)
-            base_map = sliding_window_view(win_r, wc, axis=1).max(axis=2)
-            floor_pos = np.where(base_map == 0)
-            if len(floor_pos[0]) == 0:
-                continue
-            for idx in range(min(20, len(floor_pos[0]))):
-                x, y = int(floor_pos[0][idx]), int(floor_pos[1][idx])
-                x = max(0, min(self.Lc - lc, x))
-                y = max(0, min(self.Wc - wc, y))
-                contact = self._contact_score(rot, x, y, box)
-                if contact > best_contact:
-                    best_contact = contact
-                    l, w, h = float(box["size"][0]), float(box["size"][1]), float(box["size"][2])
-                    if rot == 1: l, w = w, l
-                    best_result = (x * self.cell, y * self.cell, 0.0,
-                                   (l, w, h), 90 if rot == 1 else 0)
-        return best_result
-
-    # =====================================================================
-    #  Phase 3: 기존 박스의 column 위에 쌓기
-    #
-    #  로직:
-    #   1) self.sequence 에서 바닥 박스(z_bottom ≈ 0) 를 모두 찾음
-    #   2) 각 바닥 박스의 (x,y) 풋프린트로 column 을 정의
-    #   3) column 안에서 가장 높이 쌓인 박스(최상단)를 찾음
-    #   4) 현재 박스(버퍼)가 최상단 박스보다:
-    #      - x,y 가 같거나 작고 (넘어서지 않음)
-    #      - 질량이 같거나 작고
-    #      - 쌓은 후 컨테이너 높이를 안 넘으면
-    #   5) x,y 크기 편차가 가장 작은(밀착) column 에 배치
-    #   6) 회전(0°, 90°) 모두 시도
-    # =====================================================================
-    def _phase3_column_stack(self, box):
-        if not self.sequence:
-            return None
-
-        box_mass = float(box["mass"])
-        pallet_h = self.pallet.height
-        best_result = None
-        best_deviation = float("inf")
-
-        # 1) 바닥 박스 찾기 (z_bottom ≈ 0)
-        bottom_boxes = []
-        for placed in self.sequence:
-            pz = placed["position"][2]
-            pdz = placed["size"][2]
-            z_bottom = pz - pdz / 2.0
-            if abs(z_bottom) < 0.005:   # 바닥에 놓인 박스
-                bottom_boxes.append(placed)
-
-        if not bottom_boxes:
-            return None
-
-        # 2) 각 바닥 박스의 column 에서 최상단 박스 찾기
-        for bb in bottom_boxes:
-            bb_x0 = bb["position"][0] - bb["size"][0] / 2.0
-            bb_y0 = bb["position"][1] - bb["size"][1] / 2.0
-            bb_x1 = bb_x0 + bb["size"][0]
-            bb_y1 = bb_y0 + bb["size"][1]
-
-            # column 안의 최상단 박스 찾기
-            topmost = bb
-            topmost_ztop = bb["position"][2] + bb["size"][2] / 2.0
-            for placed in self.sequence:
-                px = placed["position"][0]
-                py = placed["position"][1]
-                # centroid 가 column 안에 있는지
-                if bb_x0 - 0.001 <= px <= bb_x1 + 0.001 and \
-                   bb_y0 - 0.001 <= py <= bb_y1 + 0.001:
-                    ztop = placed["position"][2] + placed["size"][2] / 2.0
-                    if ztop > topmost_ztop:
-                        topmost = placed
-                        topmost_ztop = ztop
-
-            # 최상단 박스 정보
-            top_l = topmost["size"][0]   # 배치된 상태의 l (이미 회전 반영)
-            top_w = topmost["size"][1]   # 배치된 상태의 w
-            top_mass = topmost["mass"]
-            top_z = topmost_ztop         # 최상단 표면 z 좌표
-
-            # 3) 현재 박스가 최상단 위에 올라갈 수 있는지 확인
-            for rot in (0, 1):
-                bl, bw, bh = float(box["size"][0]), float(box["size"][1]), float(box["size"][2])
-                if rot == 1:
-                    bl, bw = bw, bl
-
-                # 조건: 크기 ≤ 최상단 (넘어서지 않음)
-                if bl > top_l + 0.001 or bw > top_w + 0.001:
-                    continue
-                # 조건: 질량 ≤ 최상단 질량
-                if box_mass > top_mass + 0.001:
-                    continue
-                # 조건: 높이 제한
-                if top_z + bh > pallet_h + 0.001:
-                    continue
-
-                # 크기 편차 (작을수록 밀착)
-                deviation = abs(bl - top_l) + abs(bw - top_w)
-
-                if deviation < best_deviation:
-                    best_deviation = deviation
-                    # 최상단 박스 위에 중앙 정렬로 배치
-                    # anchor (front-left-bottom) 좌표 계산
-                    top_cx = topmost["position"][0]
-                    top_cy = topmost["position"][1]
-                    anchor_x = top_cx - bl / 2.0
-                    anchor_y = top_cy - bw / 2.0
-                    anchor_z = top_z
-                    best_result = (anchor_x, anchor_y, anchor_z,
-                                   (bl, bw, bh),
-                                   90 if rot == 1 else 0)
-
-        return best_result
-
     # -----------------------------------------------------------------------
-    # _find_position: 3단계 전략
-    #   Phase 1: CNN + anchor (mask 단계에서 anchor AND-필터 적용, 전체 유효
-    #            후보 중 argmax — CNN raw top-K 안에만 갇히지 않음)
-    #   Phase 2: 바닥 갭 채우기 (CNN 포기 후, 물리조건 없이)
-    #   Phase 3: column 위에 쌓기 (크기+질량+높이만 검사)
+    # _find_position: run()이 호출. 박스 하나의 최적 (x,y,z,dims,rotation) 반환.
+    #                 배치 불가면 None 반환.
+    #
+    # [Anchor] anchor 필터가 _mask_one 안에서 이미 적용됨(벽/기존 박스 모서리에
+    #          붙는 위치만 남기고, 전멸 시 자동 폴백). 그래서 여기서는 그 결과
+    #          위에서 순수 argmax만 하면 됨 — CNN raw top-K 안에 없던 밀착
+    #          위치도 물리적으로 유효하기만 하면 항상 후보에 남는다.
     # -----------------------------------------------------------------------
     def _find_position(self, box):
-        # ---- Phase 1: CNN + anchor ----
-        # anchor 필터는 _mask_one 안에서 이미 적용됨(전멸 시 자동 폴백).
-        # 그래서 여기서는 그 결과 위에서 순수 argmax만 하면 됨 — 재순위 불필요.
         try:
             M = np.zeros((self.N, 2, self.Lc, self.Wc), dtype=np.float32)
             for rot in (0, 1):
                 M[0, rot] = self._mask_one(box, rot)
+            if M.sum() == 0:
+                return None
 
-            if M.sum() > 0:
-                state = self._build_state_single(box)
-                logits, _ = self.sess.run(["logits", "value"], {"state": state})
-                logits = np.asarray(logits).reshape(-1)
-                mask_flat = M.reshape(-1)
-                if mask_flat.shape[0] == logits.shape[0]:
-                    masked = np.where(mask_flat > 0, logits, -1e30)
-                    per_cand = 2 * self.Lc * self.Wc
-                    sub = masked[:per_cand]
+            state = self._build_state_single(box)
+            logits, _ = self.sess.run(["logits", "value"], {"state": state})
+            logits = np.asarray(logits).reshape(-1)
+            mask_flat = M.reshape(-1)
+            if mask_flat.shape[0] != logits.shape[0]:
+                return None
 
-                    action = int(sub.argmax())
-                    _, rot, x, y = self._decode(action)
-                    lc, wc, hc = self._cells(box["size"], rot)
-                    x = max(0, min(self.Lc - lc, x))
-                    y = max(0, min(self.Wc - wc, y))
-                    base = int(self.height[x:x+lc, y:y+wc].max())
-                    l, w, h = float(box["size"][0]), float(box["size"][1]), float(box["size"][2])
-                    if rot == 1: l, w = w, l
-                    return (x * self.cell, y * self.cell, base * self.cell,
-                            (l, w, h), 90 if rot == 1 else 0)
+            masked = np.where(mask_flat > 0, logits, -1e30)
+            per_cand = 2 * self.Lc * self.Wc
+            sub = masked[:per_cand]
+
+            action = int(sub.argmax())
+
+            _, rot, x, y = self._decode(action)
+            lc, wc, hc = self._cells(box["size"], rot)
+            x = max(0, min(self.Lc - lc, x))
+            y = max(0, min(self.Wc - wc, y))
+            base = int(self.height[x:x + lc, y:y + wc].max())
+
+            l, w, h = float(box["size"][0]), float(box["size"][1]), float(box["size"][2])
+            if rot == 1:
+                l, w = w, l
+
+            xm = x * self.cell
+            ym = y * self.cell
+            zm = base * self.cell
+            rotation = 90 if rot == 1 else 0
+            return xm, ym, zm, (l, w, h), rotation
         except Exception:
-            pass
-
-        # ---- Phase 2: 바닥 갭 채우기 ----
-        try:
-            result = self._phase2_floor_gap(box)
-            if result is not None:
-                return result
-        except Exception:
-            pass
-
-        # ---- Phase 3: column 위에 쌓기 ----
-        try:
-            result = self._phase3_column_stack(box)
-            if result is not None:
-                return result
-        except Exception:
-            pass
-
-        return None
+            return None
 
     # -----------------------------------------------------------------------
     # _append_placed: run()이 호출. PlacedBox 기록 + height/topmass 갱신.

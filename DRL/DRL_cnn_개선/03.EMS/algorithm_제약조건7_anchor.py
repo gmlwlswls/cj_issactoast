@@ -61,8 +61,7 @@ class AlgorithmConfig:
     buffer_size: int
 
 
-_DEFAULTS = dict(cell=0.01, max_mass=6.0, k_hol=1.8, com_alpha0=0.45, com_alpha1=0.20,
-                  use_anchor_filter=True, anchor_use_boundary=True, anchor_use_box_edges=True)
+_DEFAULTS = dict(cell=0.01, max_mass=6.0, k_hol=1.8, com_alpha0=0.45, com_alpha1=0.20)
 
 
 class Palletizer:
@@ -86,13 +85,11 @@ class Palletizer:
         self.k_hol = float(meta["k_hol"])
         self.com_a0 = float(meta["com_alpha0"])
         self.com_a1 = float(meta["com_alpha1"])
-        self.use_anchor_filter = bool(meta["use_anchor_filter"])
-        self.anchor_use_boundary = bool(meta["anchor_use_boundary"])
-        self.anchor_use_box_edges = bool(meta["anchor_use_box_edges"])
 
         self.Lc = int(round(self.pallet.length / self.cell))
         self.Wc = int(round(self.pallet.width / self.cell))
         self.Hc = int(round(self.pallet.height / self.cell))
+        self.N = int(meta.get("N", max(1, self.algo.buffer_size)))
 
         onnx_path = os.path.join(here, onnx_name)
         if not os.path.exists(onnx_path):
@@ -102,27 +99,7 @@ class Palletizer:
             onnx_path = os.path.join(here, sorted(found)[0])
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
 
-        # N(상태 텐서 슬롯 수)은 ONNX 그래프의 실제 입력 채널 수(C = 2 + 4*N)에서
-        # 직접 역산한다. buffer_size나 model_meta.json의 N을 그대로 신뢰하지 않는
-        # 이유: _build_state_single이 항상 슬롯0만 채우므로 N은 buffer_size와
-        # 무관하게 "학습된 그래프가 원래 기대하는 채널 수"로 고정돼야 한다.
-        # (예전 버그: N을 buffer_size로 fallback시켜서, B=1 모델을 buffer_size=5
-        #  로 돌리면 상태 채널 수가 안 맞아 ONNX 추론이 매번 예외로 실패했음.)
-        self.N = self._infer_state_slots(meta)
-
         self._reset_state()
-
-    def _infer_state_slots(self, meta) -> int:
-        """ONNX 입력(state) 텐서 shape에서 N을 역산. 실패 시에만 meta의 N,
-        그마저 없으면 1로 고정한다 — buffer_size는 절대 fallback으로 쓰지 않음."""
-        try:
-            shp = self.sess.get_inputs()[0].shape   # 보통 [batch, C, Lc, Wc]
-            C = shp[1]
-            if isinstance(C, int) and C >= 6 and (C - 2) % 4 == 0:
-                return (C - 2) // 4
-        except Exception:
-            pass
-        return int(meta.get("N", 1))
 
     # -----------------------------------------------------------------------
     # 상태 관리
@@ -130,11 +107,6 @@ class Palletizer:
     def _reset_state(self) -> None:
         self.height = np.zeros((self.Lc, self.Wc), dtype=np.int32)
         self.topmass = np.zeros((self.Lc, self.Wc), dtype=np.float32)
-        # anchor(모서리 밀착) 후보용 — 학습 스크립트(model_learn7)와 동일 규칙.
-        # 크기를 Lc+1/Wc+1로 잡아 박스 오른쪽/윗쪽 모서리(x+lc, y+wc)가 팔레트 끝에
-        # 딱 붙는 경우까지 인덱싱 오류 없이 기록한다.
-        self._edge_x = np.zeros(self.Lc + 1, dtype=bool)
-        self._edge_y = np.zeros(self.Wc + 1, dtype=bool)
         self.sequence: List[PlacedBox] = []
         self.finished = False
         self.terminated_step: Optional[int] = None
@@ -215,48 +187,9 @@ class Palletizer:
         hol_ok = floor | (float(box["mass"]) <= self.k_hol * safe_supp)
 
         ok = (~overflow) & geom & com_ok & hol_ok
-
-        # anchor(모서리 밀착) 필터: 벽/기존 박스 모서리에 붙는 위치만 남기고,
-        # 그런 위치가 하나도 없으면(전멸) 원래 ok로 폴백한다. Phase1의 후보 풀
-        # 자체를 여기서 좁히기 때문에, CNN의 raw top-K 안에 없던 위치도
-        # (물리적으로 유효하기만 하면) 항상 후보에 남는다.
-        if self.use_anchor_filter:
-            anchor = self._anchor_mask_2d(lc, wc, vr, vc)
-            restricted = ok & anchor
-            if restricted.any():
-                ok = restricted
-
         full = np.zeros((Lc, Wc), dtype=np.float32)
         full[:vr, :vc] = ok.astype(np.float32)
         return full
-
-    # -----------------------------------------------------------------------
-    # 헬퍼: anchor(모서리 밀착) 마스크 — model_learn7 학습 스크립트와 동일 규칙
-    # -----------------------------------------------------------------------
-    def _anchor_mask_2d(self, lc, wc, vr, vc):
-        """(x, y) = 이번에 놓일 박스의 좌하단 시작 셀 좌표.
-
-        x-anchor: x==0(왼쪽 벽) / x==vr-1(오른쪽 벽) /
-                  self._edge_x[x](왼쪽 면이 기존 모서리에 닿음) /
-                  self._edge_x[x+lc](오른쪽 면이 기존 모서리에 닿음)
-        y도 동일. 최종 anchor는 x-anchor AND y-anchor(코너 지점)로 정의한다.
-        """
-        ax = np.zeros(vr, dtype=bool)
-        ay = np.zeros(vc, dtype=bool)
-
-        if self.anchor_use_boundary:
-            ax[0] = True
-            ax[vr - 1] = True
-            ay[0] = True
-            ay[vc - 1] = True
-
-        if self.anchor_use_box_edges:
-            ax |= self._edge_x[:vr]
-            ax |= self._edge_x[lc:lc + vr]
-            ay |= self._edge_y[:vc]
-            ay |= self._edge_y[wc:wc + vc]
-
-        return ax[:, None] & ay[None, :]
 
     # -----------------------------------------------------------------------
     # 헬퍼: 상태 텐서 (단일 박스를 슬롯0에 넣음)
@@ -437,15 +370,12 @@ class Palletizer:
 
     # -----------------------------------------------------------------------
     # _find_position: 3단계 전략
-    #   Phase 1: CNN + anchor (mask 단계에서 anchor AND-필터 적용, 전체 유효
-    #            후보 중 argmax — CNN raw top-K 안에만 갇히지 않음)
+    #   Phase 1: CNN + anchor (기존 모델 그대로)
     #   Phase 2: 바닥 갭 채우기 (CNN 포기 후, 물리조건 없이)
     #   Phase 3: column 위에 쌓기 (크기+질량+높이만 검사)
     # -----------------------------------------------------------------------
     def _find_position(self, box):
         # ---- Phase 1: CNN + anchor ----
-        # anchor 필터는 _mask_one 안에서 이미 적용됨(전멸 시 자동 폴백).
-        # 그래서 여기서는 그 결과 위에서 순수 argmax만 하면 됨 — 재순위 불필요.
         try:
             M = np.zeros((self.N, 2, self.Lc, self.Wc), dtype=np.float32)
             for rot in (0, 1):
@@ -461,7 +391,32 @@ class Palletizer:
                     per_cand = 2 * self.Lc * self.Wc
                     sub = masked[:per_cand]
 
-                    action = int(sub.argmax())
+                    # Anchor 재순위
+                    K = 10
+                    valid_count = int((sub > -1e29).sum())
+                    K = min(K, max(1, valid_count))
+                    if K <= 1:
+                        action = int(sub.argmax())
+                    else:
+                        top_idx = np.argpartition(sub, -K)[-K:]
+                        top_logits = sub[top_idx]
+                        lo, hi = top_logits.min(), top_logits.max()
+                        best_combined = -1e30
+                        action = int(top_idx[np.argmax(top_logits)])
+                        alpha = 0.5
+                        for i, a in enumerate(top_idx):
+                            a = int(a)
+                            _, ri, xi, yi = self._decode(a)
+                            lc, wc, _ = self._cells(box["size"], ri)
+                            xi = max(0, min(self.Lc - lc, xi))
+                            yi = max(0, min(self.Wc - wc, yi))
+                            norm = (float(sub[a]) - lo) / (hi - lo) if hi - lo > 1e-8 else 1.0
+                            contact = self._contact_score(ri, xi, yi, box)
+                            combined = norm * (1 - alpha) + contact * alpha
+                            if combined > best_combined:
+                                best_combined = combined
+                                action = a
+
                     _, rot, x, y = self._decode(action)
                     lc, wc, hc = self._cells(box["size"], rot)
                     x = max(0, min(self.Lc - lc, x))
@@ -521,12 +476,6 @@ class Palletizer:
         yc = max(0, min(self.Wc - wc, yc))
         self.height[xc:xc + lc, yc:yc + wc] = base + hc
         self.topmass[xc:xc + lc, yc:yc + wc] = float(box["mass"])
-
-        # anchor 갱신: 실제로 놓인 위치의 좌/우, 아래/위 모서리를 anchor 후보로 기록.
-        self._edge_x[xc] = True
-        self._edge_x[xc + lc] = True
-        self._edge_y[yc] = True
-        self._edge_y[yc + wc] = True
 
         self.cursor_x += dx
         self.row_depth = max(self.row_depth, dy)
