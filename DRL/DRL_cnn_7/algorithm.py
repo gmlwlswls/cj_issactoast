@@ -61,7 +61,7 @@ class AlgorithmConfig:
     buffer_size: int
 
 
-_DEFAULTS = dict(cell=0.01, max_mass=6.0, k_hol=1.8, com_alpha0=0.45, com_alpha1=0.20)
+_DEFAULTS = dict(cell=0.01, max_mass=6.0)
 
 
 class Palletizer:
@@ -82,9 +82,6 @@ class Palletizer:
 
         self.cell = float(meta["cell"])
         self.max_mass = float(meta["max_mass"])
-        self.k_hol = float(meta["k_hol"])
-        self.com_a0 = float(meta["com_alpha0"])
-        self.com_a1 = float(meta["com_alpha1"])
 
         self.Lc = int(round(self.pallet.length / self.cell))
         self.Wc = int(round(self.pallet.width / self.cell))
@@ -148,45 +145,40 @@ class Palletizer:
         vr, vc = base.shape
 
         support_cnt = np.zeros((vr, vc), dtype=np.int32)
-        corner_cnt = np.zeros((vr, vc), dtype=np.int32)
+        corner_cnt = np.zeros((vr, vc), dtype=np.int32)              # 네 모서리 지지 카운트
         supp_mass_min = np.full((vr, vc), np.inf, dtype=np.float32)
-        sum_di = np.zeros((vr, vc), dtype=np.float32)
-        sum_dj = np.zeros((vr, vc), dtype=np.float32)
 
+        # 네 모서리 상대 좌표
         corners = {(0, 0), (lc - 1, 0), (0, wc - 1), (lc - 1, wc - 1)}
+
         for di in range(lc):
             for dj in range(wc):
                 sub = H[di:di + vr, dj:dj + vc]
                 eq = (sub == base)
                 support_cnt += eq
-                sum_di += eq * di
-                sum_dj += eq * dj
                 tm = self.topmass[di:di + vr, dj:dj + vc]
                 supp_mass_min = np.where(eq, np.minimum(supp_mass_min, tm), supp_mass_min)
                 if (di, dj) in corners:
                     corner_cnt += eq
 
         area = lc * wc
-        ratio = support_cnt / area
+
+        # (2) 높이 초과
         overflow = (base + hc) > self.Hc
-        geom = (((ratio > 0.60) & (corner_cnt >= 4)) |
-                ((ratio > 0.80) & (corner_cnt >= 3)) |
-                (ratio > 0.95))
 
-        with np.errstate(invalid="ignore"):
-            cen_di = np.where(support_cnt > 0, sum_di / np.maximum(support_cnt, 1), lc / 2.0)
-            cen_dj = np.where(support_cnt > 0, sum_dj / np.maximum(support_cnt, 1), wc / 2.0)
-        off_i = np.abs(cen_di - (lc - 1) / 2.0) / max(lc / 2.0, 1e-6)
-        off_j = np.abs(cen_dj - (wc - 1) / 2.0) / max(wc / 2.0, 1e-6)
-        m = float(box["mass"]) / self.max_mass
-        alpha = self.com_a0 + (self.com_a1 - self.com_a0) * m
-        com_ok = (off_i <= alpha) & (off_j <= alpha)
-
+        # (3) 지지 기하 (강화 조건):
+        #     면적 지지율 >= 75%  AND  네 모서리 중 3개 이상 지지
+        #     바닥(base == 0)이면 무조건 통과.
         floor = (base == 0)
-        safe_supp = np.where(np.isfinite(supp_mass_min), supp_mass_min, 0.0)
-        hol_ok = floor | (float(box["mass"]) <= self.k_hol * safe_supp)
+        geom = floor | ((support_cnt >= 0.75 * area) & (corner_cnt >= 3))
 
-        ok = (~overflow) & geom & com_ok & hol_ok
+        # (4) CoM 마진 → 제거
+
+        # (5) heavy-on-light (강화): 배치 박스 질량 <= 2 × 최소 지지 박스 질량
+        safe_supp = np.where(np.isfinite(supp_mass_min), supp_mass_min, 0.0)
+        hol_ok = floor | (float(box["mass"]) <= 2.0 * safe_supp)
+
+        ok = (~overflow) & geom & hol_ok
         full = np.zeros((Lc, Wc), dtype=np.float32)
         full[:vr, :vc] = ok.astype(np.float32)
         return full
